@@ -75,6 +75,7 @@ class Pipeline:
                  copy_streams: Optional[List[List[AbstractStream]]] = None,
                  skip_layout: Optional[SkipLayout] = None,
                  checkpoint_stop: int = 0,
+                 checkpoint_partitions: Optional[Iterable[int]] = None,
                  ) -> None:
         self.batches = batches
         self.partitions = partitions
@@ -92,6 +93,11 @@ class Pipeline:
 
         self.skip_layout = skip_layout
         self.checkpoint_stop = checkpoint_stop
+        self.checkpoint_partitions: Optional[List[int]]
+        if checkpoint_partitions is None:
+            self.checkpoint_partitions = None
+        else:
+            self.checkpoint_partitions = list(checkpoint_partitions)
 
     def run(self) -> None:
         """Runs pipeline parallelism.
@@ -153,6 +159,7 @@ class Pipeline:
         devices = self.devices
         copy_streams = self.copy_streams
         checkpoint_stop = self.checkpoint_stop
+        checkpoint_partitions = self.checkpoint_partitions
 
         n = len(partitions)
         streams = [current_stream(d) for d in devices]
@@ -192,7 +199,8 @@ class Pipeline:
                 wait(batch, copy_streams[j][i], streams[j])
 
             # Determine whether checkpointing or not.
-            checkpoint = (i < checkpoint_stop)
+            checkpoint = (i < checkpoint_stop and
+                          (checkpoint_partitions is None or j in checkpoint_partitions))
             if checkpoint:
                 def function(input: TensorOrTensors,
                              partition: nn.Sequential = partition,
