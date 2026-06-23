@@ -1,5 +1,6 @@
 """The GPipe interface."""
 from collections import OrderedDict
+from collections.abc import Iterable as ABCIterable
 from typing import TYPE_CHECKING, Any, Iterable, List, Optional, Tuple, Union, cast
 
 import torch
@@ -19,6 +20,7 @@ __all__ = ['GPipe']
 
 Device = Union[torch.device, int, str]
 Devices = Union[Iterable[Device], List[Device]]
+CheckpointLayers = Union[int, Iterable[int]]
 
 Tensors = Tuple[Tensor, ...]
 TensorOrTensors = Union[Tensor, Tensors]
@@ -127,6 +129,55 @@ def split_module(module: nn.Sequential,
     return partitions, balance, devices
 
 
+def select_checkpoint_partitions(checkpoint_layers: Optional[CheckpointLayers],
+                                 balance: List[int],
+                                 ) -> Tuple[Optional[List[int]], Optional[List[int]]]:
+    """Maps selected layer indices to selected partition indices.
+
+    Returns:
+        A tuple of (layers, partitions). If layers and partitions are
+        :data:`None`, every partition is eligible for checkpointing.
+
+    """
+    if checkpoint_layers is None:
+        return None, None
+
+    if isinstance(checkpoint_layers, int):
+        checkpoint_layers = [checkpoint_layers]
+    elif not isinstance(checkpoint_layers, ABCIterable):
+        raise TypeError('checkpoint_layers must be an integer or an iterable of integers')
+
+    num_layers = sum(balance)
+    layers: List[int] = []
+
+    for layer in checkpoint_layers:
+        if not isinstance(layer, int):
+            raise TypeError('checkpoint_layers must be an integer or an iterable of integers')
+
+        original_layer = layer
+        if layer < 0:
+            layer += num_layers
+
+        if layer < 0 or layer >= num_layers:
+            raise ValueError('checkpoint layer index out of range '
+                             f'(layer: {original_layer}, length: {num_layers})')
+
+        if layer not in layers:
+            layers.append(layer)
+
+    partitions: List[int] = []
+    start = 0
+    for j, size in enumerate(balance):
+        stop = start + size
+        for layer in layers:
+            if start <= layer < stop:
+                partitions.append(j)
+                break
+        start = stop
+
+    return layers, partitions
+
+
 MOVING_DENIED = TypeError('denied to move parameters and buffers, '
                           'because GPipe should manage device placement')
 
@@ -165,6 +216,11 @@ class GPipe(Module):
         checkpoint (str):
             when to enable checkpointing, one of ``'always'``,
             ``'except_last'``, or ``'never'`` (default: ``'except_last'``)
+        checkpoint_layers (int or iterable of ints):
+            layer indices to checkpoint. :data:`None` checkpoints every
+            partition selected by ``checkpoint``. If supplied, only partitions
+            containing the selected layers are checkpointed. Negative indices
+            are supported (default: :data:`None`)
         deferred_batch_norm (bool):
             whether to use deferred BatchNorm moving statistics (default:
             :data:`False`, see :ref:`Deferred Batch Normalization` for more
@@ -208,6 +264,10 @@ class GPipe(Module):
     #: of ``'always'``, ``'except_last'``, or ``'never'``.
     checkpoint: str = 'except_last'
 
+    #: The layer indices selected for checkpointing. :data:`None` means all
+    #: layers/partitions are eligible.
+    checkpoint_layers: Optional[List[int]] = None
+
     def __init__(self,
                  module: nn.Sequential,
                  balance: Optional[Iterable[int]] = None,
@@ -215,6 +275,7 @@ class GPipe(Module):
                  devices: Optional[Devices] = None,
                  chunks: int = chunks,
                  checkpoint: str = checkpoint,
+                 checkpoint_layers: Optional[CheckpointLayers] = None,
                  deferred_batch_norm: bool = False,
                  ) -> None:
         super().__init__()
@@ -250,6 +311,9 @@ class GPipe(Module):
             self.partitions, self.balance, self.devices = split_module(module, balance, devices)
         except BalanceError as exc:
             raise ValueError(recommend_auto_balance(str(exc)))
+
+        self.checkpoint_layers, self._checkpoint_partitions = select_checkpoint_partitions(
+            checkpoint_layers, self.balance)
 
         self._copy_streams: List[List[AbstractStream]] = []
         self._skip_layout = inspect_skip_layout(self.partitions)
@@ -372,7 +436,8 @@ class GPipe(Module):
                             self.devices,
                             copy_streams,
                             self._skip_layout,
-                            checkpoint_stop)
+                            checkpoint_stop,
+                            self._checkpoint_partitions)
         pipeline.run()
 
         # Merge the micro-batches into one mini-batch.
