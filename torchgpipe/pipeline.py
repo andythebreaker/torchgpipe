@@ -75,7 +75,7 @@ class Pipeline:
                  copy_streams: Optional[List[List[AbstractStream]]] = None,
                  skip_layout: Optional[SkipLayout] = None,
                  checkpoint_stop: int = 0,
-                 checkpoint_partitions: Optional[Iterable[int]] = None,
+                 checkpoint_segments: Optional[List[List[nn.Sequential]]] = None,
                  ) -> None:
         self.batches = batches
         self.partitions = partitions
@@ -93,11 +93,7 @@ class Pipeline:
 
         self.skip_layout = skip_layout
         self.checkpoint_stop = checkpoint_stop
-        self.checkpoint_partitions: Optional[List[int]]
-        if checkpoint_partitions is None:
-            self.checkpoint_partitions = None
-        else:
-            self.checkpoint_partitions = list(checkpoint_partitions)
+        self.checkpoint_segments = checkpoint_segments
 
     def run(self) -> None:
         """Runs pipeline parallelism.
@@ -159,7 +155,7 @@ class Pipeline:
         devices = self.devices
         copy_streams = self.copy_streams
         checkpoint_stop = self.checkpoint_stop
-        checkpoint_partitions = self.checkpoint_partitions
+        checkpoint_segments = self.checkpoint_segments
 
         n = len(partitions)
         streams = [current_stream(d) for d in devices]
@@ -199,19 +195,52 @@ class Pipeline:
                 wait(batch, copy_streams[j][i], streams[j])
 
             # Determine whether checkpointing or not.
-            checkpoint = (i < checkpoint_stop and
-                          (checkpoint_partitions is None or j in checkpoint_partitions))
+            checkpoint = (i < checkpoint_stop)
             if checkpoint:
-                def function(input: TensorOrTensors,
-                             partition: nn.Sequential = partition,
-                             skip_tracker: SkipTrackerThroughPotals = skip_trackers[i],
-                             ) -> TensorOrTensors:
-                    with use_skip_tracker(skip_tracker):
-                        return partition(input)
+                if checkpoint_segments is None:
+                    segments = [partition]
+                else:
+                    segments = checkpoint_segments[j]
 
-                chk = Checkpointing(function, batch)
-                task = Task(streams[j], compute=chk.checkpoint, finalize=chk.recompute)
-                del function, chk
+                checkpoints: List[Checkpointing] = []
+                checkpointed_batches: List[Batch] = []
+
+                def compute(batch: Batch = batch,
+                            segments: List[nn.Sequential] = segments,
+                            skip_tracker: SkipTrackerThroughPotals = skip_trackers[i],
+                            checkpoints: List[Checkpointing] = checkpoints,
+                            checkpointed_batches: List[Batch] = checkpointed_batches,
+                            ) -> Batch:
+                    checkpoints.clear()
+                    checkpointed_batches.clear()
+
+                    for segment in segments:
+                        def function(input: TensorOrTensors,
+                                     segment: nn.Sequential = segment,
+                                     skip_tracker: SkipTrackerThroughPotals = skip_tracker,
+                                     ) -> TensorOrTensors:
+                            with use_skip_tracker(skip_tracker):
+                                return segment(input)
+
+                        chk = Checkpointing(function, batch)
+                        batch = chk.checkpoint()
+                        checkpoints.append(chk)
+                        checkpointed_batches.append(batch)
+
+                    return batch
+
+                def finalize(batch: Batch,
+                             checkpoints: List[Checkpointing] = checkpoints,
+                             checkpointed_batches: List[Batch] = checkpointed_batches,
+                             ) -> None:
+                    if checkpointed_batches:
+                        checkpointed_batches[-1] = batch
+
+                    for chk, checkpointed_batch in zip(checkpoints, checkpointed_batches):
+                        chk.recompute(checkpointed_batch)
+
+                task = Task(streams[j], compute=compute, finalize=finalize)
+                del compute, finalize
 
             else:
                 def compute(batch: Batch = batch,
