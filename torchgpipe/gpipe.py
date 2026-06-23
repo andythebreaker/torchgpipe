@@ -127,6 +127,71 @@ def split_module(module: nn.Sequential,
     return partitions, balance, devices
 
 
+def normalize_checkpoint_layers(checkpoint_layers: Optional[Iterable[int]],
+                                num_layers: int,
+                                ) -> Optional[List[int]]:
+    """Normalizes layer indexes selected as checkpoint starts."""
+    if checkpoint_layers is None:
+        return None
+
+    normalized = []
+    for index in checkpoint_layers:
+        raw_index = int(index)
+        index = raw_index
+        if index < 0:
+            index += num_layers
+        if index < 0 or index >= num_layers:
+            raise IndexError('checkpoint layer index out of range '
+                             f'(layers: {num_layers}, index: {raw_index})')
+        normalized.append(index)
+
+    return sorted(set(normalized))
+
+
+def default_checkpoint_layers(balance: Iterable[int]) -> List[int]:
+    """Finds the first layer of every partition."""
+    checkpoint_layers = []
+    start = 0
+
+    for size in balance:
+        checkpoint_layers.append(start)
+        start += size
+
+    return checkpoint_layers
+
+
+def split_checkpoint_segments(checkpoint_layers: Iterable[int],
+                              balance: Iterable[int],
+                              ) -> List[List[Tuple[int, int, bool]]]:
+    """Splits each partition into checkpointed and normal segments.
+
+    Each segment is represented as ``(start, stop, checkpoint)`` where
+    ``start`` and ``stop`` are local layer indexes in the partition.
+    """
+    checkpoint_layer_set = set(checkpoint_layers)
+    segments = []
+
+    absolute_start = 0
+    for size in balance:
+        absolute_stop = absolute_start + size
+
+        boundaries = [absolute_start]
+        boundaries += sorted(index for index in checkpoint_layer_set
+                             if absolute_start < index < absolute_stop)
+        boundaries.append(absolute_stop)
+
+        partition_segments = []
+        for start, stop in zip(boundaries, boundaries[1:]):
+            partition_segments.append((start - absolute_start,
+                                       stop - absolute_start,
+                                       start in checkpoint_layer_set))
+
+        segments.append(partition_segments)
+        absolute_start = absolute_stop
+
+    return segments
+
+
 MOVING_DENIED = TypeError('denied to move parameters and buffers, '
                           'because GPipe should manage device placement')
 
@@ -165,6 +230,11 @@ class GPipe(Module):
         checkpoint (str):
             when to enable checkpointing, one of ``'always'``,
             ``'except_last'``, or ``'never'`` (default: ``'except_last'``)
+        checkpoint_layers (iterable of ints):
+            layer indexes in the underlying sequential module selected as
+            checkpoint starts. Each selected index starts a checkpointed segment
+            at that layer. By default, checkpointing starts at the first layer
+            of each partition, preserving the original behavior.
         deferred_batch_norm (bool):
             whether to use deferred BatchNorm moving statistics (default:
             :data:`False`, see :ref:`Deferred Batch Normalization` for more
@@ -176,7 +246,8 @@ class GPipe(Module):
         ValueError:
             invalid arguments, or wrong balance
         IndexError:
-            the number of devices is fewer than the number of partitions.
+            the number of devices is fewer than the number of partitions, or a
+            checkpoint layer index is out of range.
 
     """
 
@@ -208,6 +279,9 @@ class GPipe(Module):
     #: of ``'always'``, ``'except_last'``, or ``'never'``.
     checkpoint: str = 'except_last'
 
+    #: The layer indexes selected as checkpoint starts.
+    checkpoint_layers: List[int] = []
+
     def __init__(self,
                  module: nn.Sequential,
                  balance: Optional[Iterable[int]] = None,
@@ -215,6 +289,7 @@ class GPipe(Module):
                  devices: Optional[Devices] = None,
                  chunks: int = chunks,
                  checkpoint: str = checkpoint,
+                 checkpoint_layers: Optional[Iterable[int]] = None,
                  deferred_batch_norm: bool = False,
                  ) -> None:
         super().__init__()
@@ -250,6 +325,14 @@ class GPipe(Module):
             self.partitions, self.balance, self.devices = split_module(module, balance, devices)
         except BalanceError as exc:
             raise ValueError(recommend_auto_balance(str(exc)))
+
+        self.checkpoint_layers = normalize_checkpoint_layers(checkpoint_layers,
+                                                             sum(self.balance))
+        if self.checkpoint_layers is None:
+            self.checkpoint_layers = default_checkpoint_layers(self.balance)
+
+        self._checkpoint_segments = split_checkpoint_segments(self.checkpoint_layers,
+                                                              self.balance)
 
         self._copy_streams: List[List[AbstractStream]] = []
         self._skip_layout = inspect_skip_layout(self.partitions)
@@ -372,7 +455,8 @@ class GPipe(Module):
                             self.devices,
                             copy_streams,
                             self._skip_layout,
-                            checkpoint_stop)
+                            checkpoint_stop,
+                            self._checkpoint_segments)
         pipeline.run()
 
         # Merge the micro-batches into one mini-batch.

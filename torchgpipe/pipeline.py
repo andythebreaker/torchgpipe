@@ -1,7 +1,7 @@
 """The pipeline parallelism of GPipe."""
 from queue import Queue
 from types import TracebackType
-from typing import TYPE_CHECKING, Iterable, List, Optional, Tuple, Type, Union, cast
+from typing import TYPE_CHECKING, Callable, Iterable, List, Optional, Tuple, Type, Union, cast
 
 import torch
 from torch import Tensor, nn
@@ -22,6 +22,12 @@ Tensors = Tuple[Tensor, ...]
 TensorOrTensors = Union[Tensor, Tensors]
 
 ExcInfo = Tuple[Type[BaseException], BaseException, TracebackType]
+
+# A segment is represented as (start, stop, checkpoint), where start and stop
+# are local layer indexes in a partition.
+Segment = Tuple[int, int, bool]
+CheckpointSegments = List[List[Segment]]
+Finalize = Callable[[Batch], None]
 
 # Queue is generic only in stubs.
 # https://mypy.readthedocs.io/en/latest/common_issues.html#using-classes-that-are-generic-in-stubs-but-not-at-runtime
@@ -65,6 +71,65 @@ def clock_cycles(m: int, n: int) -> Iterable[List[Tuple[int, int]]]:
         yield [(k-j, j) for j in range(max(1+k-m, 0), min(1+k, n))]
 
 
+def call_segment(partition: nn.Sequential,
+                 start: int,
+                 stop: int,
+                 input: TensorOrTensors,
+                 ) -> TensorOrTensors:
+    """Calls a subset of layers in a partition."""
+    for index in range(start, stop):
+        input = partition[index](input)
+
+    return input
+
+
+def checkpoint_by_segments(batch: Batch,
+                           partition: nn.Sequential,
+                           skip_tracker: SkipTrackerThroughPotals,
+                           segments: List[Segment],
+                           finalizers: List[Finalize],
+                           ) -> Batch:
+    """Applies checkpointing only to selected segments in a partition."""
+    partition_length = len(partition)
+
+    for start, stop, checkpoint in segments:
+        if checkpoint:
+            def function(input: TensorOrTensors,
+                         partition: nn.Sequential = partition,
+                         start: int = start,
+                         stop: int = stop,
+                         skip_tracker: SkipTrackerThroughPotals = skip_tracker,
+                         ) -> TensorOrTensors:
+                with use_skip_tracker(skip_tracker):
+                    return call_segment(partition, start, stop, input)
+
+            chk = Checkpointing(function, batch)
+            batch = chk.checkpoint()
+
+            if stop == partition_length:
+                finalizers.append(chk.recompute)
+            else:
+                chk.recompute(batch)
+
+            del function, chk
+
+        else:
+            def compute(input: TensorOrTensors,
+                        partition: nn.Sequential = partition,
+                        start: int = start,
+                        stop: int = stop,
+                        skip_tracker: SkipTrackerThroughPotals = skip_tracker,
+                        ) -> TensorOrTensors:
+                with use_skip_tracker(skip_tracker):
+                    return call_segment(partition, start, stop, input)
+
+            batch = batch.call(compute)
+
+            del compute
+
+    return batch
+
+
 class Pipeline:
     """The pipeline parallelism for GPipe."""
 
@@ -75,6 +140,7 @@ class Pipeline:
                  copy_streams: Optional[List[List[AbstractStream]]] = None,
                  skip_layout: Optional[SkipLayout] = None,
                  checkpoint_stop: int = 0,
+                 checkpoint_segments: Optional[CheckpointSegments] = None,
                  ) -> None:
         self.batches = batches
         self.partitions = partitions
@@ -92,6 +158,11 @@ class Pipeline:
 
         self.skip_layout = skip_layout
         self.checkpoint_stop = checkpoint_stop
+
+        if checkpoint_segments is None:
+            checkpoint_segments = [[(0, len(partition), True)]
+                                   for partition in partitions]
+        self.checkpoint_segments = checkpoint_segments
 
     def run(self) -> None:
         """Runs pipeline parallelism.
@@ -153,6 +224,7 @@ class Pipeline:
         devices = self.devices
         copy_streams = self.copy_streams
         checkpoint_stop = self.checkpoint_stop
+        checkpoint_segments = self.checkpoint_segments
 
         n = len(partitions)
         streams = [current_stream(d) for d in devices]
@@ -192,18 +264,32 @@ class Pipeline:
                 wait(batch, copy_streams[j][i], streams[j])
 
             # Determine whether checkpointing or not.
-            checkpoint = (i < checkpoint_stop)
-            if checkpoint:
-                def function(input: TensorOrTensors,
-                             partition: nn.Sequential = partition,
-                             skip_tracker: SkipTrackerThroughPotals = skip_trackers[i],
-                             ) -> TensorOrTensors:
-                    with use_skip_tracker(skip_tracker):
-                        return partition(input)
+            segments = checkpoint_segments[j]
+            checkpoint = i < checkpoint_stop and any(s[2] for s in segments)
 
-                chk = Checkpointing(function, batch)
-                task = Task(streams[j], compute=chk.checkpoint, finalize=chk.recompute)
-                del function, chk
+            if checkpoint:
+                finalizers: List[Finalize] = []
+
+                def compute(batch: Batch = batch,
+                            partition: nn.Sequential = partition,
+                            skip_tracker: SkipTrackerThroughPotals = skip_trackers[i],
+                            segments: List[Segment] = segments,
+                            finalizers: List[Finalize] = finalizers,
+                            ) -> Batch:
+                    return checkpoint_by_segments(batch,
+                                                  partition,
+                                                  skip_tracker,
+                                                  segments,
+                                                  finalizers)
+
+                def finalize(batch: Batch,
+                             finalizers: List[Finalize] = finalizers,
+                             ) -> None:
+                    for finalize in finalizers:
+                        finalize(batch)
+
+                task = Task(streams[j], compute=compute, finalize=finalize)
+                del compute, finalize
 
             else:
                 def compute(batch: Batch = batch,

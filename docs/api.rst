@@ -22,6 +22,9 @@ GPipe Module
    .. autoattribute:: checkpoint
       :annotation:
 
+   .. autoattribute:: checkpoint_layers
+      :annotation:
+
 Skip Connections
 ~~~~~~~~~~~~~~~~
 
