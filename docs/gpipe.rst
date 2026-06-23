@@ -62,7 +62,9 @@ single micro-batch with checkpointing.
 Checkpointing is a trade-off between performance and memory, because
 recomputation spends time just as much as the forward propagation. When you use
 :class:`torchgpipe.GPipe`, you can decide to turn off checkpointing by
-``checkpoint='never'`` option.
+``checkpoint='never'`` option. You can also restrict checkpointing to
+partitions that contain selected sequential layer indexes with the
+``checkpoint_layers`` option.
 
 Deferred Batch Normalization
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~
